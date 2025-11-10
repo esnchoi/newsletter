@@ -2,7 +2,7 @@ name: Newsletter Community Scraper
 
 on:
   schedule:
-    - cron: '0 * * * *'   # 매시간 정각(UTC 기준, 한국은 +9시간)
+    - cron: '0 * * * *'   # 매시간 정각(UTC)
   workflow_dispatch:
 
 jobs:
@@ -26,7 +26,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          # requirements.txt가 있으면 이걸 권장
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install selenium beautifulsoup4 google-api-python-client google-auth google-auth-oauthlib; fi
 
       - name: Run scraper
         env:
