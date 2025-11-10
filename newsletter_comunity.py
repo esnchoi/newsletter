@@ -1,5 +1,6 @@
 import os
 import time
+import json
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from bs4 import BeautifulSoup
@@ -7,28 +8,56 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from urllib.parse import urljoin
 
 # Google Sheets API 설정
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-CLIENT_SECRET_FILE = r'C:\Users\7040_64bit\Documents\코드 테스트\사내뉴스레터 커뮤니티\client_secret.json'
-TOKEN_FILE = 'token.json'
+
+# 로컬 기본 경로(원본 유지). GitHub Actions에서는 GA_TOKEN_JSON만으로 동작 가능
+CLIENT_SECRET_FILE = os.getenv(
+    "GA_CLIENT_SECRET_PATH",
+    r'C:\Users\7040_64bit\Documents\코드 테스트\사내뉴스레터 커뮤니티\client_secret.json'
+)
+TOKEN_FILE = os.getenv("GA_TOKEN_PATH", "token.json")
+GA_TOKEN_JSON = os.getenv("GA_TOKEN_JSON", "").strip()  # ← Actions 시크릿에 넣을 토큰 원문(JSON)
 
 # 스프레드시트 ID와 범위 설정
 SPREADSHEET_ID = '1M5kUEQJtwGtrCqQbJHtCGvd5CFZagms07SgiZ4YZ3ZI'
 RANGE_NAME = 'A:G'  # A~G열 전체
 
 def get_credentials():
+    """
+    - GitHub Actions: GA_TOKEN_JSON이 있으면 그걸로 바로 인증(자동 refresh)
+    - 로컬: 기존 로직 그대로 (token.json 있으면 사용, 없으면 client_secret.json로 1회 로그인)
+    """
+    # 1) Actions 경로: GA_TOKEN_JSON 우선
+    if GA_TOKEN_JSON:
+        info = json.loads(GA_TOKEN_JSON)
+        creds = Credentials.from_authorized_user_info(info, SCOPES)
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        return creds
+
+    # 2) 로컬/기타: 기존 파일 기반
     creds = None
     if os.path.exists(TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
+            # 로컬에서만 브라우저 인증 허용
+            if os.getenv("GITHUB_ACTIONS") == "true":
+                raise RuntimeError("GA_TOKEN_JSON 시크릿 필요: Actions에서는 브라우저 인증을 쓸 수 없습니다.")
             flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
             creds = flow.run_local_server(port=0)
-        with open(TOKEN_FILE, 'w') as token:
-            token.write(creds.to_json())
+        # 새 토큰 저장(로컬)
+        try:
+            with open(TOKEN_FILE, 'w', encoding='utf-8') as token:
+                token.write(creds.to_json())
+        except Exception:
+            pass
     return creds
 
 def read_sheet_data(sheets_service, range_name):
@@ -43,24 +72,27 @@ def write_sheet_data(sheets_service, range_name, values):
     result = sheets_service.spreadsheets().values().append(
         spreadsheetId=SPREADSHEET_ID, range=range_name,
         valueInputOption='USER_ENTERED', body=body).execute()
-    print(f"{result.get('updates').get('updatedRows')} rows appended.")
+    print(f"{result.get('updates', {}).get('updatedRows', 0)} rows appended.")
 
 def main():
     creds = get_credentials()
     sheets_service = build('sheets', 'v4', credentials=creds)
 
-    # Selenium 설정 (정상 코드와 동일한 방식 적용)
+    # Selenium 설정 (Actions 안정화 옵션 추가)
     chrome_options = Options()
-    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--headless=new")  # 신형 헤드리스
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--window-size=1920,1080")
 
-    # WebDriver 초기화 (불필요한 service 제거, 정상 코드와 동일하게 설정)
+    # WebDriver 초기화 (Selenium 4: 자동 드라이버 관리)
     driver = webdriver.Chrome(options=chrome_options)
 
     try:
         # 사이트 접속
-        driver.get('https://newsletter.cafe24.com/community/')
+        base_list_url = 'https://newsletter.cafe24.com/community/'
+        driver.get(base_list_url)
         time.sleep(3)  # 페이지 로딩 대기
 
         # 스크롤을 아래로 이동하며 데이터 수집
@@ -74,31 +106,39 @@ def main():
             last_height = new_height
 
         # 페이지 소스 가져오기
-        page_source = driver.page_source
-
-        # BeautifulSoup으로 파싱
-        soup = BeautifulSoup(page_source, 'html.parser')
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
 
         # 게시글 추출 (공지사항 제외)
         rows = soup.select('#kboard-default-list > div.kboard-list > table > tbody > tr')
         data = []
-        base_url = 'https://newsletter.cafe24.com/community/'  # base URL 설정
         for row in rows:
-            number = row.select_one('td.kboard-list-uid').get_text(strip=True)
+            num_el = row.select_one('td.kboard-list-uid')
+            title_el = row.select_one('td.kboard-list-title a div')
+            link_el = row.select_one('td.kboard-list-title a')
+            author_el = row.select_one('td.kboard-list-user')
+            date_el = row.select_one('td.kboard-list-date')
+
+            if not (num_el and title_el and link_el):
+                continue
+
+            number = num_el.get_text(strip=True)
             if number == '공지사항':  # 번호 항목에 "공지사항"이 있으면 제외
                 continue
-            title = row.select_one('td.kboard-list-title a div').get_text(strip=True)
-            author = row.select_one('td.kboard-list-user').get_text(strip=True)
-            date = row.select_one('td.kboard-list-date').get_text(strip=True)
-            url = base_url + row.select_one('td.kboard-list-title a')['href']  # URL 추출
+
+            title = title_el.get_text(strip=True)
+            author = author_el.get_text(strip=True) if author_el else ''
+            date = date_el.get_text(strip=True) if date_el else ''
+            url = urljoin(base_list_url, link_el.get('href', ''))
 
             # 게시글 본문 및 댓글 추출
             driver.get(url)
             time.sleep(3)  # 페이지 로딩 대기
             post_soup = BeautifulSoup(driver.page_source, 'html.parser')
-            content = post_soup.select_one('#kboard-default-document > div.kboard-document-wrap > div.kboard-content > div').get_text(strip=True)
-            comments = post_soup.select('div.comments-list-content')
-            comments_text = ' '.join([comment.get_text(strip=True) for comment in comments])
+            content_el = post_soup.select_one('#kboard-default-document > div.kboard-document-wrap > div.kboard-content > div')
+            comments_els = post_soup.select('div.comments-list-content')
+
+            content = content_el.get_text(strip=True) if content_el else ''
+            comments_text = ' '.join([c.get_text(strip=True) for c in comments_els]) if comments_els else ''
 
             data.append([number, title, author, date, url, content, comments_text])
 
